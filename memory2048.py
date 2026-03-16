@@ -387,13 +387,196 @@ class Memory2048:
             "db_size_kb": os.path.getsize(self.db_path) // 1024 if os.path.exists(self.db_path) else 0,
         }
 
-    def recall(self, n: int = 10) -> list[dict]:
-        """Recall the most important memories (highest tier first, then most recent)."""
+    def recall(self, n: int = 10, context: str = "", strategy: str = "smart") -> list[dict]:
+        """First-class recall — retrieve the RIGHT memories, not just recent ones.
+
+        Strategies:
+          smart     — Weighted blend: relevance + tier + recency + compression depth
+          context   — Context-aware: score by semantic overlap with the current task
+          recent    — Most recent across all tiers (working memory)
+          deep      — Highest tier only (institutional knowledge)
+          breadth   — One from each populated tier (full spectrum)
+          category  — Group by category, pick best from each
+
+        Each memory gets a recall_score (0-100) explaining why it was selected.
+        """
+        if strategy == "recent":
+            return self._recall_recent(n)
+        elif strategy == "deep":
+            return self._recall_deep(n)
+        elif strategy == "breadth":
+            return self._recall_breadth(n)
+        elif strategy == "category":
+            return self._recall_by_category(n)
+        elif strategy == "context" and context:
+            return self._recall_contextual(n, context)
+        else:
+            return self._recall_smart(n, context)
+
+    def _recall_smart(self, n: int, context: str = "") -> list[dict]:
+        """Weighted scoring across all dimensions."""
         rows = self.conn.execute(
-            "SELECT * FROM memories ORDER BY tier DESC, created_at DESC LIMIT ?",
+            "SELECT * FROM memories ORDER BY created_at DESC LIMIT 500"
+        ).fetchall()
+
+        now = time.time()
+        scored = []
+
+        # Build context keywords for relevance matching
+        ctx_words = set()
+        if context:
+            ctx_words = set(w.lower() for w in re.findall(r'\w{3,}', context))
+
+        for row in rows:
+            r = dict(row)
+            content_lower = r["content"].lower()
+            content_words = set(re.findall(r'\w{3,}', content_lower))
+
+            # 1. Tier score (0-40): higher tier = more important
+            tier_score = (r["tier"] / 10.0) * 40
+
+            # 2. Compression depth (0-15): more compressed = more distilled
+            comp_score = min(15, r["compression_count"] * 3)
+
+            # 3. Recency (0-20): exponential decay — recent matters
+            age_hours = (now - r["created_at"]) / 3600
+            recency_score = max(0, 20 - (age_hours / 24) * 2)  # Lose 2 points per day
+
+            # 4. Context relevance (0-25): keyword overlap with current context
+            relevance_score = 0
+            if ctx_words:
+                overlap = len(ctx_words & content_words)
+                relevance_score = min(25, overlap * 5)
+
+            # 5. Information density bonus (0-10)
+            density_score = min(10, _sentence_score(r["content"][:200]) * 3)
+
+            total = tier_score + comp_score + recency_score + relevance_score + density_score
+            r["recall_score"] = round(total, 1)
+            r["recall_reason"] = (
+                f"tier={tier_score:.0f} comp={comp_score:.0f} "
+                f"recent={recency_score:.0f} relevance={relevance_score:.0f} "
+                f"density={density_score:.0f}"
+            )
+            scored.append(r)
+
+        scored.sort(key=lambda x: -x["recall_score"])
+
+        # Deduplicate — don't return near-identical memories
+        seen_prefixes = set()
+        unique = []
+        for r in scored:
+            prefix = r["content"][:80].lower()
+            if prefix not in seen_prefixes:
+                seen_prefixes.add(prefix)
+                unique.append(r)
+            if len(unique) >= n:
+                break
+
+        return unique
+
+    def _recall_recent(self, n: int) -> list[dict]:
+        """Most recent entries across all tiers — working memory."""
+        rows = self.conn.execute(
+            "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", (n,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _recall_deep(self, n: int) -> list[dict]:
+        """Highest tier only — institutional knowledge and core principles."""
+        rows = self.conn.execute(
+            """SELECT * FROM memories
+               WHERE tier >= 5
+               ORDER BY tier DESC, compression_count DESC
+               LIMIT ?""",
             (n,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def _recall_breadth(self, n: int) -> list[dict]:
+        """One from each populated tier — full spectrum of memory depth."""
+        results = []
+        for tier in range(10, -1, -1):
+            rows = self.conn.execute(
+                """SELECT * FROM memories
+                   WHERE tier = ?
+                   ORDER BY compression_count DESC, created_at DESC
+                   LIMIT ?""",
+                (tier, max(1, n // 6)),
+            ).fetchall()
+            results.extend(dict(r) for r in rows)
+        return results[:n]
+
+    def _recall_by_category(self, n: int) -> list[dict]:
+        """Group by category, pick highest-scored from each."""
+        rows = self.conn.execute(
+            """SELECT * FROM memories
+               ORDER BY tier DESC, compression_count DESC"""
+        ).fetchall()
+
+        by_cat = {}
+        for row in rows:
+            r = dict(row)
+            cat = r["category"]
+            if cat not in by_cat:
+                by_cat[cat] = r
+
+        results = sorted(by_cat.values(), key=lambda x: (-x["tier"], -x["compression_count"]))
+        return results[:n]
+
+    def _recall_contextual(self, n: int, context: str) -> list[dict]:
+        """Context-aware recall — find memories most relevant to the current task."""
+        ctx_words = set(w.lower() for w in re.findall(r'\w{3,}', context))
+        if not ctx_words:
+            return self._recall_smart(n)
+
+        # First try FTS5
+        query_terms = " OR ".join(ctx_words)
+        try:
+            rows = self.conn.execute(
+                """SELECT m.*, rank FROM memory_fts f
+                   JOIN memories m ON m.rowid = f.rowid
+                   WHERE memory_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (query_terms, n * 3),
+            ).fetchall()
+        except Exception:
+            rows = []
+
+        if not rows:
+            # Fallback: LIKE search for each keyword
+            conditions = " OR ".join(["content LIKE ?" for _ in ctx_words])
+            params = [f"%{w}%" for w in list(ctx_words)[:10]]
+            rows = self.conn.execute(
+                f"SELECT * FROM memories WHERE {conditions} ORDER BY tier DESC LIMIT ?",
+                params + [n * 3],
+            ).fetchall()
+
+        # Score by overlap + tier weight
+        scored = []
+        for row in rows:
+            r = dict(row)
+            content_words = set(re.findall(r'\w{3,}', r["content"].lower()))
+            overlap = len(ctx_words & content_words)
+            r["recall_score"] = overlap * 10 + r["tier"] * 3
+            r["recall_reason"] = f"overlap={overlap} keywords, tier={r['tier']}"
+            scored.append(r)
+
+        scored.sort(key=lambda x: -x["recall_score"])
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for r in scored:
+            prefix = r["content"][:80].lower()
+            if prefix not in seen:
+                seen.add(prefix)
+                unique.append(r)
+            if len(unique) >= n:
+                break
+
+        return unique
 
     def import_journal(self, journal_db: str = None):
         """Import existing journal entries as tier-0 memories."""
@@ -528,12 +711,37 @@ Commands:
                 print(f"  {'':22s} (compressed {r['compression_count']}x)")
 
     elif cmd == "recall":
-        n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-        memories = mem.recall(n)
-        print(f"\nTop {n} memories (highest tier first):\n")
-        for r in memories:
+        # recall [n] [strategy] [context...]
+        n = 10
+        strategy = "smart"
+        context = ""
+
+        remaining = sys.argv[2:]
+        if remaining and remaining[0].isdigit():
+            n = int(remaining.pop(0))
+        if remaining and remaining[0] in ("smart", "context", "recent", "deep", "breadth", "category"):
+            strategy = remaining.pop(0)
+        if remaining:
+            context = " ".join(remaining)
+
+        memories = mem.recall(n, context=context, strategy=strategy)
+        print(f"\n{'─' * 70}")
+        print(f"  Recall: {len(memories)} memories (strategy={strategy})")
+        if context:
+            print(f"  Context: {context[:80]}")
+        print(f"{'─' * 70}\n")
+
+        for i, r in enumerate(memories, 1):
             tier_label = f"T{r['tier']}:{r['tier_name']}"
-            print(f"  [{tier_label:20s}] {r['content'][:120]}")
+            score = r.get('recall_score', '')
+            reason = r.get('recall_reason', '')
+            print(f"  {i:>2}. [{tier_label:20s}] score={score}")
+            print(f"      {r['content'][:140]}")
+            if r['compression_count'] > 1:
+                print(f"      (compressed {r['compression_count']}x)")
+            if reason:
+                print(f"      reason: {reason}")
+            print()
 
     elif cmd == "stats":
         s = mem.stats()
